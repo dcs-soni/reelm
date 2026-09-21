@@ -1,0 +1,33 @@
+version: 1
+hash: 7c4a8d09ca3762af61e59520943dc26494f8941b
+provider: openai
+endpoint: /v1/chat/completions
+recorded_at: 2026-09-21T00:00:00Z
+request:
+  method: POST
+  path: /v1/chat/completions
+  body: |
+    {
+      "model": "gpt-4o",
+      "messages": [{"role": "user", "content": "What is the capital of France?"}]
+    }
+response:
+  status_code: 200
+  headers:
+    Content-Type: application/json
+  body: |
+    {
+      "id": "chatcmpl-fixture",
+      "object": "chat.completion",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "The capital of France is Paris."
+          },
+          "finish_reason": "stop"
+        }
+      ]
+    }
+  latency: 120ms
