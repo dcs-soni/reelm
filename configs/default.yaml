@@ -1,0 +1,25 @@
+mode: auto
+listen_addr: ":8080"
+admin_addr: ":8081"
+cassette_dir: "./cassettes"
+cassette_format: "yaml"
+default_timeout: 120s
+
+providers:
+  - name: openai
+    base_url: "https://api.openai.com"
+    path_prefix: "/v1"
+    headers:
+      - "Authorization"
+      - "OpenAI-Organization"
+      - "OpenAI-Project"
+    strip_auth: true
+
+matching:
+  fuzzy_enabled: false
+  similarity_threshold: 0.92
+  max_candidates: 100
+
+log:
+  level: "info"
+  format: "console"
