@@ -14,6 +14,27 @@ providers:
       - "OpenAI-Organization"
       - "OpenAI-Project"
     strip_auth: true
+  - name: anthropic
+    base_url: "https://api.anthropic.com"
+    path_prefix: "/v1/messages"
+    headers:
+      - "x-api-key"
+      - "anthropic-version"
+      - "anthropic-beta"
+    strip_auth: true
+  - name: gemini
+    base_url: "https://generativelanguage.googleapis.com"
+    path_prefix: "/v1beta"
+    headers:
+      - "x-goog-api-key"
+    strip_auth: true
+
+streaming:
+  replay_mode: "instant"
+
+tls:
+  enabled: true
+  ca_dir: ""
 
 matching:
   fuzzy_enabled: false

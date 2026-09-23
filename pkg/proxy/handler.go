@@ -12,18 +12,21 @@ import (
 	"github.com/dcs-soni/reelm/pkg/hasher"
 	"github.com/dcs-soni/reelm/pkg/hasher/providers"
 	"github.com/dcs-soni/reelm/pkg/store"
+	"github.com/dcs-soni/reelm/pkg/streaming"
 	"github.com/dcs-soni/reelm/pkg/telemetry"
 	"github.com/rs/zerolog"
 )
 
-// Handler orchestrates request routing, canonicalization, hashing, replay, and recording.
+// Handler orchestrates request routing, canonicalization, hashing, replay, streaming, and recording.
 type Handler struct {
-	cfg        *config.Config
-	store      store.Store
-	hasher     hasher.Hasher
-	registry   *providers.Registry
-	httpClient *http.Client
-	logger     zerolog.Logger
+	cfg            *config.Config
+	store          store.Store
+	hasher         hasher.Hasher
+	registry       *providers.Registry
+	httpClient     *http.Client
+	logger         zerolog.Logger
+	streamReplayer *streaming.StreamReplayer
+	caManager      *CAManager
 }
 
 // NewHandler initializes a proxy HTTP handler with the given components.
@@ -35,6 +38,19 @@ func NewHandler(cfg *config.Config, s store.Store, h hasher.Hasher, reg *provide
 		h = hasher.NewDefaultHasher()
 	}
 
+	replayMode := streaming.ReplayMode(cfg.Streaming.ReplayMode)
+	if replayMode == "" {
+		replayMode = streaming.ReplayModeInstant
+	}
+
+	var caMgr *CAManager
+	if cfg.TLS.Enabled {
+		mgr, err := NewCAManager(cfg.TLS.CADir)
+		if err == nil {
+			caMgr = mgr
+		}
+	}
+
 	return &Handler{
 		cfg:      cfg,
 		store:    s,
@@ -43,16 +59,30 @@ func NewHandler(cfg *config.Config, s store.Store, h hasher.Hasher, reg *provide
 		httpClient: &http.Client{
 			Timeout: cfg.DefaultTimeout,
 		},
-		logger: telemetry.RootLogger.With().Str("component", "proxy").Logger(),
+		logger:         telemetry.RootLogger.With().Str("component", "proxy").Logger(),
+		streamReplayer: streaming.NewStreamReplayer(replayMode),
+		caManager:      caMgr,
 	}
+}
+
+// SetCAManager allows setting or mocking the CA manager.
+func (h *Handler) SetCAManager(mgr *CAManager) {
+	h.caManager = mgr
 }
 
 // ServeHTTP handles every proxied request.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+
+	// 1. Intercept HTTP CONNECT method for transparent HTTPS tunneling
+	if r.Method == http.MethodConnect {
+		h.HandleConnect(w, r)
+		return
+	}
+
 	reqID := r.Header.Get("X-Reelm-Request-Id")
 
-	// 1. Health checks & internal utility routes
+	// 2. Health checks & internal utility routes
 	if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -60,7 +90,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Identify provider
+	// 3. Identify provider
 	providerName, canonicalizer, err := h.registry.DetectProvider(r)
 	if err != nil {
 		h.logger.Warn().Str("path", r.URL.Path).Err(err).Msg("failed to detect provider")
@@ -70,7 +100,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	reqLog := telemetry.RequestLogger(reqID, providerName, r.URL.Path, h.cfg.Mode)
 
-	// 3. Buffer request body
+	// 4. Buffer request body
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
 		reqLog.Error().Err(err).Msg("failed to read request body")
@@ -81,7 +111,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Restore body for any downstream reads
 	r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	// 4. Canonicalize and Hash request
+	// 5. Canonicalize and Hash request
 	canonic, err := canonicalizer.Canonicalize(r, bodyBytes)
 	if err != nil {
 		reqLog.Error().Err(err).Msg("failed to canonicalize request")
@@ -99,7 +129,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Reelm-Hash", hash)
 	reqLog = reqLog.With().Str("hash", hash).Str("model", canonic.Model).Logger()
 
-	// 5. Evaluate operating mode
+	// 6. Evaluate operating mode
 	switch strings.ToLower(h.cfg.Mode) {
 	case config.ModeReplay:
 		h.handleReplay(w, r, hash, reqLog, start)
@@ -167,12 +197,6 @@ func (h *Handler) handleRecord(w http.ResponseWriter, r *http.Request, providerN
 	defer resp.Body.Close()
 
 	upstreamLatency := time.Since(respStart)
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Error().Err(err).Msg("failed to read upstream response body")
-		http.Error(w, `{"error":"failed to read upstream response body"}`, http.StatusBadGateway)
-		return
-	}
 
 	// Capture headers for cassette
 	cassetteRespHeaders := make(map[string]string)
@@ -182,7 +206,59 @@ func (h *Handler) handleRecord(w http.ResponseWriter, r *http.Request, providerN
 		}
 	}
 
-	// Save Cassette
+	contentType := resp.Header.Get("Content-Type")
+	isStream := strings.Contains(contentType, "text/event-stream")
+
+	w.Header().Set("X-Reelm-Cache", "RECORDED")
+	copyHeaders(resp.Header, w.Header())
+
+	if isStream {
+		// Real-time SSE streaming passthrough and recording
+		w.WriteHeader(resp.StatusCode)
+
+		recorder := streaming.NewStreamRecorder()
+		if err := recorder.PipeAndRecord(w, resp.Body); err != nil {
+			log.Error().Err(err).Msg("error while streaming SSE response to client")
+		}
+
+		cassette := &store.Cassette{
+			Version:    store.CurrentCassetteVersion,
+			Hash:       hash,
+			Namespace:  canonic.Namespace,
+			Provider:   providerName,
+			Endpoint:   r.URL.Path,
+			RecordedAt: time.Now().UTC(),
+			Request: store.CassetteRequest{
+				Method: r.Method,
+				Path:   r.URL.Path,
+				Body:   string(bodyBytes),
+			},
+			Response: store.CassetteResponse{
+				StatusCode: resp.StatusCode,
+				Headers:    cassetteRespHeaders,
+				Body:       recorder.FullBody(),
+				Chunks:     recorder.Chunks(),
+				IsStream:   true,
+				Latency:    upstreamLatency,
+			},
+		}
+
+		if err := h.store.Save(cassette); err != nil {
+			log.Error().Err(err).Msg("failed to save streaming cassette to store")
+		} else {
+			log.Info().Str("hash", hash).Int("chunks", len(recorder.Chunks())).Msg("recorded new streaming cassette")
+		}
+		return
+	}
+
+	// Non-streaming response
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to read upstream response body")
+		http.Error(w, `{"error":"failed to read upstream response body"}`, http.StatusBadGateway)
+		return
+	}
+
 	cassette := &store.Cassette{
 		Version:    store.CurrentCassetteVersion,
 		Hash:       hash,
@@ -209,9 +285,6 @@ func (h *Handler) handleRecord(w http.ResponseWriter, r *http.Request, providerN
 		log.Info().Str("hash", hash).Msg("recorded new cassette")
 	}
 
-	// Write response to client
-	w.Header().Set("X-Reelm-Cache", "RECORDED")
-	copyHeaders(resp.Header, w.Header())
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBytes)
 
@@ -228,12 +301,31 @@ func (h *Handler) serveCassette(w http.ResponseWriter, c *store.Cassette, cacheS
 	w.Header().Set("X-Reelm-Hash", c.Hash)
 
 	for k, v := range c.Response.Headers {
-		// Avoid hop-by-hop headers
 		if !isHopByHopHeader(k) {
 			w.Header().Set(k, v)
 		}
 	}
 
+	// Handle streaming replay
+	if c.Response.IsStream && len(c.Response.Chunks) > 0 {
+		statusCode := c.Response.StatusCode
+		if statusCode == 0 {
+			statusCode = http.StatusOK
+		}
+		w.WriteHeader(statusCode)
+		if err := h.streamReplayer.Replay(w, c.Response.Chunks); err != nil {
+			log.Error().Err(err).Msg("failed to replay streaming chunks")
+		} else {
+			log.Info().
+				Str("cache", cacheStatus).
+				Int("chunks", len(c.Response.Chunks)).
+				Dur("latency_ms", time.Since(start)).
+				Msg("served streaming response from cassette")
+		}
+		return
+	}
+
+	// Standard non-streaming replay
 	statusCode := c.Response.StatusCode
 	if statusCode == 0 {
 		statusCode = http.StatusOK
@@ -262,9 +354,14 @@ func (h *Handler) resolveUpstreamURL(providerName, path, query string) (string, 
 		}
 	}
 
-	// Default fallback for OpenAI
-	if strings.EqualFold(providerName, "openai") {
+	// Provider-specific default fallbacks
+	switch strings.ToLower(providerName) {
+	case "openai":
 		return "https://api.openai.com" + path, nil
+	case "anthropic":
+		return "https://api.anthropic.com" + path, nil
+	case "gemini":
+		return "https://generativelanguage.googleapis.com" + path, nil
 	}
 
 	return "", fmt.Errorf("no upstream configuration configured for provider %q", providerName)

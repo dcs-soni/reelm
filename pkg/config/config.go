@@ -23,20 +23,22 @@ const (
 
 // Config represents the complete runtime configuration for Reelm.
 type Config struct {
-	Mode           string        `mapstructure:"mode"`
-	ListenAddr     string        `mapstructure:"listen_addr"`
-	AdminAddr      string        `mapstructure:"admin_addr"`
-	CassetteDir    string        `mapstructure:"cassette_dir"`
-	CassetteFormat string        `mapstructure:"cassette_format"` // "yaml" or "json"
-	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
-	Providers      []Provider    `mapstructure:"providers"`
-	Matching       MatchConfig   `mapstructure:"matching"`
-	Log            LogConfig     `mapstructure:"log"`
+	Mode           string          `mapstructure:"mode"`
+	ListenAddr     string          `mapstructure:"listen_addr"`
+	AdminAddr      string          `mapstructure:"admin_addr"`
+	CassetteDir    string          `mapstructure:"cassette_dir"`
+	CassetteFormat string          `mapstructure:"cassette_format"` // "yaml" or "json"
+	DefaultTimeout time.Duration   `mapstructure:"default_timeout"`
+	Providers      []Provider      `mapstructure:"providers"`
+	Matching       MatchConfig     `mapstructure:"matching"`
+	Streaming      StreamingConfig `mapstructure:"streaming"`
+	TLS            TLSConfig       `mapstructure:"tls"`
+	Log            LogConfig       `mapstructure:"log"`
 }
 
 // Provider defines upstream API provider endpoints and behavior.
 type Provider struct {
-	Name        string            `mapstructure:"name"`        // "openai", "anthropic", "gemini"
+	Name        string            `mapstructure:"name"`        // "openai", "anthropic", "gemini", "azure"
 	BaseURL     string            `mapstructure:"base_url"`    // e.g. "https://api.openai.com"
 	PathPrefix  string            `mapstructure:"path_prefix"` // optional routing prefix, e.g. "/v1"
 	Headers     []string          `mapstructure:"headers"`     // headers to pass through to upstream
@@ -50,6 +52,17 @@ type MatchConfig struct {
 	SimilarityThreshold float64  `mapstructure:"similarity_threshold"` // 0.0 to 1.0 (default: 0.92)
 	MaxCandidates       int      `mapstructure:"max_candidates"`       // default: 100
 	StopWords           []string `mapstructure:"stop_words"`
+}
+
+// StreamingConfig controls SSE streaming behavior.
+type StreamingConfig struct {
+	ReplayMode string `mapstructure:"replay_mode"` // "instant" or "timed" (default: "instant")
+}
+
+// TLSConfig controls transparent HTTPS interception and certificate authority generation.
+type TLSConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	CADir   string `mapstructure:"ca_dir"`
 }
 
 // LogConfig controls logging verbosity and format.
@@ -79,11 +92,38 @@ func DefaultConfig() *Config {
 				},
 				StripAuth: true,
 			},
+			{
+				Name:       "anthropic",
+				BaseURL:    "https://api.anthropic.com",
+				PathPrefix: "/v1/messages",
+				Headers: []string{
+					"x-api-key",
+					"anthropic-version",
+					"anthropic-beta",
+				},
+				StripAuth: true,
+			},
+			{
+				Name:       "gemini",
+				BaseURL:    "https://generativelanguage.googleapis.com",
+				PathPrefix: "/v1beta",
+				Headers: []string{
+					"x-goog-api-key",
+				},
+				StripAuth: true,
+			},
 		},
 		Matching: MatchConfig{
 			FuzzyEnabled:        false,
 			SimilarityThreshold: 0.92,
 			MaxCandidates:       100,
+		},
+		Streaming: StreamingConfig{
+			ReplayMode: "instant",
+		},
+		TLS: TLSConfig{
+			Enabled: true,
+			CADir:   "",
 		},
 		Log: LogConfig{
 			Level:  "info",
@@ -106,6 +146,9 @@ func Load(cfgFile string) (*Config, error) {
 	v.SetDefault("matching.fuzzy_enabled", cfg.Matching.FuzzyEnabled)
 	v.SetDefault("matching.similarity_threshold", cfg.Matching.SimilarityThreshold)
 	v.SetDefault("matching.max_candidates", cfg.Matching.MaxCandidates)
+	v.SetDefault("streaming.replay_mode", cfg.Streaming.ReplayMode)
+	v.SetDefault("tls.enabled", cfg.TLS.Enabled)
+	v.SetDefault("tls.ca_dir", cfg.TLS.CADir)
 	v.SetDefault("log.level", cfg.Log.Level)
 	v.SetDefault("log.format", cfg.Log.Format)
 

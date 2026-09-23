@@ -15,8 +15,12 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, config.ModeAuto, cfg.Mode)
 	assert.Equal(t, ":8080", cfg.ListenAddr)
 	assert.Equal(t, config.FormatYAML, cfg.CassetteFormat)
-	assert.Len(t, cfg.Providers, 1)
+	assert.Len(t, cfg.Providers, 3)
 	assert.Equal(t, "openai", cfg.Providers[0].Name)
+	assert.Equal(t, "anthropic", cfg.Providers[1].Name)
+	assert.Equal(t, "gemini", cfg.Providers[2].Name)
+	assert.Equal(t, "instant", cfg.Streaming.ReplayMode)
+	assert.True(t, cfg.TLS.Enabled)
 	assert.NoError(t, cfg.Validate())
 }
 
@@ -107,7 +111,7 @@ matching:
 	assert.Equal(t, config.FormatJSON, loaded.CassetteFormat)
 	assert.True(t, loaded.Matching.FuzzyEnabled)
 	assert.Equal(t, 0.85, loaded.Matching.SimilarityThreshold)
-	// Default provider preserved
-	assert.Len(t, loaded.Providers, 1)
+	// Default providers preserved
+	assert.Len(t, loaded.Providers, 3)
 	assert.Equal(t, "openai", loaded.Providers[0].Name)
 }
